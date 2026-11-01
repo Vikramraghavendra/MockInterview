@@ -1,0 +1,64 @@
+
+1. Core Functional Requirements (User Experience)
+
+
+Domain Selection & Setup
+
+• Domain Selection Dropdown: Before an interview begins, users choose their specific target track (e.g., Backend System Design, Data Engineering, Frontend UI Components).
+• Knowledge Base Injection: Choosing a domain dynamically mounts a domain-specific Knowledge Base (KB) and an Expectations Matrix into the AI Evaluator's evaluation loop.
+• Problem Generation: The system prompts the user with a tailored coding challenge based on their choice (e.g., building a rate limiter for Backend, or an optimized virtualization list for Frontend).
+
+Real-Time Interview Interface
+
+• The Zero-Lag IDE: A fully functional browser text editor that captures structural text insertions without lagging or freezing.
+• Microphone Activity Indicator: A visual audio waveform indicator giving candidates real-time feedback that their voice is being captured cleanly.
+• One-Click Submission: A single action button that gracefully halts audio recording, commits the final code state, and transitions the user to a "Processing Analytics" loading screen.
+
+🤖 2. Domain Knowledge Base & AI Agent Architecture
+
+To evaluate if a candidate meets industry expectations, we feed the AI Evaluation Agent two explicit structural inputs per domain.
+
+The System Domain Matrix
+
+
+Selected Domain	Knowledge Base Context Dump (What AI checks against)	Candidate Expectations Matrix (The Grading Rubric)
+Backend Engineering	Common design patterns, concurrency limits, caching layers (Redis), database scaling, network protocols (REST, WebSockets, gRPC).	1. States scale constraints (RPS, storage size) before coding.
+2. Communicates horizontal/vertical scaling tradeoffs.
+3. Catches edge cases (e.g., Null pointers, Network drops).
+Frontend Engineering	Browser rendering pipeline, DOM optimization, state management architectures, accessible web standards (ARIA), asset optimization.	1. Discusses user experience (UX) and performance bottlenecks.
+2. Explains component re-render impacts.
+3. Factors in state lifecycle and memory cleanups.
+Data Engineering	Distributed computing primitives, ETL pipeline structures, batch vs. streaming processing paradigms, schema validation frameworks.	1. Clarifies data schema requirements and typing up-front.
+2. Discusses processing backpressure and out-of-order logs.
+3. Accounts for idempotent write operations.
+
+
+🛠️ 3. Non-Functional & Technical Requirements
+
+
+Data Accuracy & Integrity
+
+• Clock Alignment Target: The frontend session time tracking must sync up with audio transcription timestamps with a maximum margin of error under ±250 milliseconds.
+• Lossless Buffering: If a candidate's internet briefly stutters, the local browser cache must buffer code updates and audio chunks locally and push them to the backend server as soon as the connection recovers.
+
+System Metrics & Performance Thresholds
+
+• Editor Latency: Editor input response delays must stay strictly under 16ms (60 FPS rendering target) to ensure smooth writing conditions.
+• Analysis Turnaround: The complete evaluation processing time—including audio transcription, timeline alignment parsing, and structured LLM evaluation—must deliver results within 90 seconds of final submission.
+
+📊 4. The Analytical Output (The Evaluation Rubric)
+
+When processing completes, the AI output maps directly to a 3-tier scoring framework:
+
+1. The Interaction Metrics
+
+• Talk-to-Code Velocity Ratio: Calculated as total words spoken per minute relative to characters typed per minute. Highlights whether a candidate types in complete silence or over-explores trivia.
+• Dead Air Flags: Identifies any silent span stretching longer than 12 seconds alongside a brief snippet of the exact code block written during that specific gap.
+
+2. Communication Quality Classification
+
+• Syntax Narrator vs. Strategic Thinker: Categorizes the candidate’s speaking behavior. Flags instances where they literally read out the keys they press ("Now I am initializing an empty map...") instead of explaining the core logic ("I am setting up a hash map to look up historical values in O(1) time...").
+
+3. Structural Domain Scoring
+
+• Assumption Validation Check: A binary flag identifying whether the candidate explicitly asked questions or documented domain architectural constraints before implementing their primary logic functions.

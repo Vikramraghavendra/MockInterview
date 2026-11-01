@@ -1,0 +1,346 @@
+Here is the updated, production-grade Technical Implementation Specification restructured to match your decoupled architecture (Frontend, Manager, Worker Pool).
+
+💻 1. User Experience & Frontend Architecture
+
+The frontend is a single-page application designed for real-time, low-latency audio capture and keystroke instrumentation without blocking the UI thread.
+• Tech Stack: React (v19+), @monaco-editor/react, TailwindCSS (UI styling), Recharts (interactive timeline visualizations).
+• Core Clients & State Components:
+
+State Management (UserSessionContext)
+
+Manages the global state of the active interview session, local monotonic clock configurations, and connectivity statuses.
+javascript
+// UserSessionContext.js
+import React, { createContext, useState, useRef } from 'react';
+
+export const UserSessionContext = createContext(null);
+
+export const UserSessionProvider = ({ children }) => {
+  const [sessionState, setSessionState] = useState('IDLE'); // IDLE, ACTIVE, PROCESSING, COMPLETED
+  const [selectedDomain, setSelectedDomain] = useState('backend_systems');
+  const sessionClock = useRef({ startTime: 0 });
+
+  const startClock = () => {
+    sessionClock.current.startTime = performance.now();
+  };
+
+  const getElapsedMs = () => {
+    if (!sessionClock.current.startTime) return 0;
+    return Math.round(performance.now() - sessionClock.current.startTime);
+  };
+
+  return (
+    <UserSessionContext.Provider value={{ sessionState, setSessionState, selectedDomain, setSelectedDomain, startClock, getElapsedMs }}>
+      {children}
+    </UserSessionContext.Provider>
+  );
+};
+Use code with caution.
+
+Audio Capture Client (AudioStreamer.js)
+
+Captures 16kHz mono audio via the browser's Web Audio API and pipes raw binary chunks downstream.
+javascript
+// AudioStreamer.js
+export class AudioStreamer {
+  constructor(sessionId, getElapsedMs, onChunkReady) {
+    this.sessionId = sessionId;
+    this.getElapsedMs = getElapsedMs;
+    this.onChunkReady = onChunkReady;
+    this.mediaRecorder = null;
+    this.stream = null;
+  }
+
+  async start() {
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    
+    // Resample to 16kHz mono natively in the browser for transcription optimization
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    const source = audioCtx.createMediaStreamSource(this.stream);
+    const destination = audioCtx.createMediaStreamDestination();
+    source.connect(destination);
+
+    this.mediaRecorder = new MediaRecorder(destination.stream, { mimeType: 'audio/webm' });
+    
+    this.mediaRecorder.ondataavailable = async (e) => {
+      if (e.data.size > 0) {
+        const timestamp = this.getElapsedMs();
+        this.onChunkReady(e.data, timestamp);
+      }
+    };
+
+    // Emit explicit 1-second audio chunks into the stream queue
+    this.mediaRecorder.start(1000);
+  }
+
+  stop() {
+    if (this.mediaRecorder) this.mediaRecorder.stop();
+    if (this.stream) this.stream.getTracks().forEach(track => track.stop());
+  }
+}
+Use code with caution.
+
+IDE Instrumentation Client (CodeTracker.js)
+
+Tracks granular document delta frames via Monaco Editor bindings.
+javascript
+// CodeTracker.js
+export class CodeTracker {
+  constructor(getElapsedMs, onMutationDetected) {
+    this.getElapsedMs = getElapsedMs;
+    this.onMutationDetected = onMutationDetected;
+  }
+
+  attachEditor(editor) {
+    editor.onDidChangeModelContent((event) => {
+      const payload = {
+        event_type: "CODE_MUTATION",
+        session_timestamp_ms: this.getElapsedMs(),
+        data: {
+          text_inserted: event.changes[0]?.text || '',
+          change_range: event.changes[0]?.range || null,
+          total_lines: editor.getModel().getLineCount()
+        }
+      };
+      this.onMutationDetected(payload);
+    });
+  }
+}
+Use code with caution.
+
+🏢 2. Backend Architecture: Manager & Worker Pool
+
+The backend decouples API orchestration from heavy processing tasks using a Fast API Gateway, a stateful ingestion cache, and a distributed worker cluster.
+                              [ FRONTEND CLIENT ]
+                                       │
+                    ┌──────────────────┴──────────────────┐
+                    ▼ (Audio Stream / Blobs)              ▼ (Code Mutation JSONs)
+       POST /api/session/audio/chunk          POST /api/session/code/event
+                    │                                     │
+                    └──────────────────┬──────────────────┘
+                                       ▼
+       ┌──────────────────────────────────────────────────────────────┐
+       │                 2.a MANAGER (FastAPI Pod)                    │
+       │  • Validates sessions & permissions                          │
+       │  • Streams chunks natively to App Cache (Redis / S3)        │
+       │  • Dispatches payload job references to Message Broker       │
+       └───────────────────────────────┬──────────────────────────────┘
+                                       │
+                                       ▼ (Redis Broker Queue)
+       ┌──────────────────────────────────────────────────────────────┐
+       │                  2.b WORKER POOL (Celery Cluster)            │
+       │  • Pulls raw payloads from object cache                      │
+       │  • Worker Job Task A: Whisper Audio Transcription            │
+       │  • Worker Job Task B: Linear Stream Time Alignment Engine    │
+       │  • Worker Job Task C: Multi-Domain LLM Rubric Evaluation     │
+       │  • Persists Graded Reports to PostgreSQL                     │
+       └───────────────────────────────┬──────────────────────────────┘
+                                       │
+                                       ▼ (Server-Sent Events / Polling)
+                              [ FRONTEND CLIENT ]
+
+2.a The Manager Node (manager.py)
+
+The Manager handles request ingestion, signature validation, session management, and ephemeral caching. It acts as the gatekeeper, offloading processing tasks to the worker pool immediately.
+python
+# manager.py
+import os
+import uuid
+import json
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
+from pydantic import BaseModel
+import redis
+
+app = FastAPI(title="Interview Ingestion Manager")
+
+# In-Memory Cache Initialization for low-latency writes
+cache_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+broker_client = redis.Redis(host='localhost', port=6379, db=1)
+
+class CodeMutationPayload(BaseModel):
+    session_id: str
+    session_timestamp_ms: int
+    data: dict
+
+@app.post("/api/session/start")
+def start_session(domain_id: str):
+    session_id = str(uuid.uuid4())
+    # Initialize basic validation metadata inside cache store
+    cache_client.hset(f"session:{session_id}", mapping={"domain_id": domain_id, "status": "ACTIVE"})
+    return {"session_id": session_id, "status": "ACTIVE"}
+
+@app.post("/api/session/code/event")
+def receive_code_event(payload: CodeMutationPayload):
+    # Verify session is actively managed
+    session_meta = cache_client.hgetall(f"session:{payload.session_id}")
+    if not session_meta or session_meta.get("status") != "ACTIVE":
+        raise HTTPException(status_code=400, detail="Invalid or inactive session identifier.")
+    
+    # Push mutation logs straight onto a fast Redis List cache
+    event_data = {
+        "event_type": "CODE_MUTATION",
+        "session_timestamp_ms": payload.session_timestamp_ms,
+        "data": payload.data
+    }
+    cache_client.rpush(f"session:{payload.session_id}:code", json.dumps(event_data))
+    return {"status": "ACK"}
+
+@app.post("/api/session/audio/chunk")
+async def receive_audio_chunk(
+    session_id: str = Form(...),
+    timestamp_ms: int = Form(...),
+    chunk: UploadFile = File(...)
+):
+    session_meta = cache_client.hgetall(f"session:{session_id}")
+    if not session_meta:
+        raise HTTPException(status_code=400, detail="Session context missing.")
+
+    # Stream chunks locally to an immutable system processing file path
+    upload_dir = f"/tmp/sessions/{session_id}"
+    os.makedirs(upload_dir, exist_ok=True)
+    chunk_path = f"{upload_dir}/chunk_{timestamp_ms}.webm"
+    
+    with open(chunk_path, "wb") as buffer:
+        buffer.write(await chunk.read())
+        
+    # Append structured manifest mappings to track audio chunk ordering
+    cache_client.rpush(f"session:{session_id}:audio_manifest", json.dumps({
+        "timestamp_ms": timestamp_ms,
+        "file_path": chunk_path
+    }))
+    return {"status": "ACK"}
+
+@app.post("/api/session/submit")
+def submit_session(session_id: str):
+    session_meta = cache_client.hgetall(f"session:{session_id}")
+    if not session_meta:
+        raise HTTPException(status_code=404, detail="Target session not found.")
+        
+    # Atomic state transition change to block further stream writes
+    cache_client.hset(f"session:{session_id}", "status", "PROCESSING")
+    
+    # SPAWN THE WORKER JOB: Push a pointer message reference down into the queue
+    job_payload = {
+        "job_id": str(uuid.uuid4()),
+        "session_id": session_id,
+        "domain_id": session_meta["domain_id"]
+    }
+    broker_client.rpush("queue:processing_jobs", json.dumps(job_payload))
+    
+    return {"status": "PROCESSING", "message": "Job successfully spawned in the worker pool queue."}
+Use code with caution.
+
+2.b The Worker Node (worker.py)
+
+The Worker Pool contains independent compute instances that process heavy audio conversion, run text-to-speech synchronization maps, evaluate syntax patterns with LLM models, and save the final report.
+python
+# worker.py
+import time
+import json
+import os
+import redis
+from typing import List, Dict
+
+# Connect to infrastructure resources
+cache_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+broker_client = redis.Redis(host='localhost', port=6379, db=1)
+
+def run_audio_stitching_and_transcription(session_id: str) -> List[Dict]:
+    """
+    Task A: Stitches fragmented raw .webm files and feeds them 
+    into a word-level timestamp transcription pipeline (e.g., Whisper).
+    """
+    manifest_items = cache_client.lrange(f"session:{session_id}:audio_manifest", 0, -1)
+    # Orchestrate stitching logic via tools like FFmpeg inside production pipelines
+    print(f"[Worker] Compiling {len(manifest_items)} audio slices for session {session_id}...")
+    
+    # Mock output matching precision word timestamp metadata layout returned from Whisper
+    return [
+        {"session_timestamp_ms": 5200, "word": "let's", "confidence": 0.95},
+        {"session_timestamp_ms": 5500, "word": "create", "confidence": 0.98},
+        {"session_timestamp_ms": 5800, "word": "a", "confidence": 0.99},
+        {"session_timestamp_ms": 6000, "word": "hash", "confidence": 0.97},
+        {"session_timestamp_ms": 6200, "word": "map", "confidence": 0.97}
+    ]
+
+def run_timeline_alignment_algorithm(code_events: List[Dict], speech_tokens: List[Dict]) -> List[Dict]:
+    """
+    Task B: Performs linear timeline interleaving and uncovers structural quiet zones.
+    """
+    for event in code_events:
+        event["event_type"] = "CODE_MUTATION"
+    for token in speech_tokens:
+        token["event_type"] = "SPEECH_TOKEN"
+        
+    unified_timeline = sorted(code_events + speech_tokens, key=lambda x: x["session_timestamp_ms"])
+    
+    # Identify extended silence gaps (> 12 seconds)
+    last_speech_ms = 0
+    for block in unified_timeline:
+        if block["event_type"] == "SPEECH_TOKEN":
+            last_speech_ms = block["session_timestamp_ms"]
+        elif block["event_type"] == "CODE_MUTATION":
+            gap = block["session_timestamp_ms"] - last_speech_ms
+            if gap > 12000:
+                block["silence_warning"] = True
+                block["gap_duration_ms"] = gap
+                
+    return unified_timeline
+
+def evaluate_via_llm_agent(domain_id: str, aligned_timeline: List[Dict]) -> Dict:
+    """
+    Task C: Runs evaluation metrics against domain profiles 
+    and outputs structured grading information.
+    """
+    print(f"[Worker] Evaluating timeline output metrics against domain profile parameters: {domain_id}")
+    # In production, pass structured data dump arrays directly into an internal LLM execution routing function
+    return {
+        "communication_score": 85,
+        "structural_classification": "STRATEGIC_THINKER",
+        "critique_summary": "Strong architectural explanations stated before typing. No long silence paths logged."
+    }
+
+def start_worker_loop():
+    print("[Worker Pool Cluster] Workers actively waiting for jobs...")
+    while True:
+        # Long-poll the queue using blocking operations to conserve compute cycles
+        job_raw = broker_client.blpop("queue:processing_jobs", timeout=5)
+        if not job_raw:
+            continue
+            
+        job_data = json.loads(job_raw[1].decode('utf-8'))
+        session_id = job_data["session_id"]
+        domain_id = job_data["domain_id"]
+        
+        print(f"[Worker] Processing initiated for job task context reference: {session_id}")
+        
+        try:
+            # 1. Gather all unstructured event logs from the cache layer
+            raw_code_logs = cache_client.lrange(f"session:{session_id}:code", 0, -1)
+            code_events = [json.loads(x) for x in raw_code_logs]
+            
+            # 2. Extract vocal speech tokens
+            speech_tokens = run_audio_stitching_and_transcription(session_id)
+            
+            # 3. Align timelines chronologically
+            aligned_timeline = run_timeline_alignment_algorithm(code_events, speech_tokens)
+            
+            # 4. Generate structured evaluations matching knowledge profiles
+            final_report = evaluate_via_llm_agent(domain_id, aligned_timeline)
+            
+            # 5. Persist artifacts and update status to complete
+            cache_client.hset(f"session:{session_id}", "status", "COMPLETED")
+            cache_client.set(f"session:{session_id}:result", json.dumps({
+                "report": final_report,
+                "timeline": aligned_timeline
+            }))
+            
+            print(f"[Worker] Job completed for session {session_id}. Analytics are ready.")
+            
+        except Exception as err:
+            print(f"[Worker ERROR] Failure processing session reference {session_id}: {str(err)}")
+            cache_client.hset(f"session:{session_id}", "status", "FAILED")
+
+if __name__ == "__main__":
+    start_worker_loop()
+Use code with caution.

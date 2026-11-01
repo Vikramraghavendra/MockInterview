@@ -1,0 +1,115 @@
+To turn this concept into a functional, production-ready portfolio piece, the system must process asynchronous, heterogeneous data streams (audio and text-based code mutations) and align them on a unified timeline.
+Below is the detailed system design and implementation plan for building this platform.
+
+📐 System Design Architecture
+
+                                  [ USER BROWSER ]
+   ┌─────────────────────────────────────┴─────────────────────────────────────┐
+   ▼ (Web Audio API)                                             ▼ (Monaco IDE)
+[ Audio Stream ]                                             [ Code Delta Stream ]
+   │                                                           │
+   ▼ (WebSocket / Chunks)                                      ▼ (WebSocket / Event JSON)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                            API GATEWAY / INGESTION                           │
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                          FASTAPI CORE APPLICATION                            │
+│                                                                              │
+│  ┌────────────────────────┐      ┌──────────────────┐      ┌──────────────┐  │
+│  │  Whisper Audio Pipe   │      │ Change Log Pipe  │      │ Cache/Buffer │  │
+│  └───────────┬────────────┘      └────────┬─────────┘      └──────┬───────┘  │
+└──────────────┼────────────────────────────┼───────────────────────┼──────────┘
+               ▼                            ▼                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           TIMELINE ALIGNMENT ENGINE                          │
+│                    (Interleaves Words & Keystroke Diffs)                     │
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                             LLM EVALUATION AGENT                             │
+│                 (Chronological Context Window + Rubric Scoring)              │
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                          ANALYTICS & VISUALIZATION                           │
+│                 (Timeline JSON Graph -> Frontend Dashboard)                 │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+Data Models & State Schema
+
+The entire application relies on a unified epoch-timestamp metric (milliseconds elapsed since session start).
+
+1. Code Delta Event
+
+Captured via the frontend IDE on every meaningful structural mutation (debounced or per-line commit).
+json
+{
+  "event_type": "code_mutation",
+  "session_timestamp_ms": 14250,
+  "data": {
+    "change_range": {"start_line": 3, "end_line": 3, "start_col": 1, "end_col": 24},
+    "text_inserted": "def process_stream(data):",
+    "total_lines": 12,
+    "ast_node_hint": "FunctionDef"
+  }
+}
+Use code with caution.
+
+2. Audio Transcript Word Token
+
+Emitted by the Whisper engine following phrase or word-level tracking.
+json
+{
+  "event_type": "speech_token",
+  "session_timestamp_ms": 14900,
+  "data": {
+    "word": "process",
+    "confidence": 0.98,
+    "duration_ms": 320
+  }
+}
+Use code with caution.
+
+🚀 Implementation Phase Plan
+
+
+Phase 1: Frontend Event Ingestion (Week 1)
+
+Build a lightweight, highly accurate client capturing side-by-side streams without introducing editor lag.
+• Audio Capture: Implement a MediaRecorder pipeline pulling from navigator.mediaDevices.getUserMedia. Encode down to 16kHz mono WAV chunks (the native input shape for Whisper models) to minimise bandwidth.
+• Editor Hook: Mount @monaco-editor/react. Hook into onDidChangeModelContent. To prevent huge payloads, pass raw string diffs or structural updates rather than sending the full document text on every keypress.
+• State Control: Build a centralized orchestrator maintaining a local monotonic clock (performance.now()) initialized the second the user clicks "Start Interview". Stamp every audio blob metadata packet and code event using this clock.
+
+Phase 2: Backend Streaming & Ingestion (Week 2)
+
+Construct a decoupled backend capable of handling high-frequency text payloads alongside heavy binary audio ingestion.
+• FastAPI Ingestion Layer: Spin up twin WebSocket routing points: /ws/session/{id}/audio and /ws/session/{id}/code. Store raw streams in a temporary cache (like Redis or local memory buffers) during live execution.
+• Transcription Workers: Upon completion, pass the compiled audio file to an asynchronous celery/background process targeting an OpenAI Whisper API endpoint (or a local faster-whisper instance). Enforce strict word-level tracking to map text directly back to the timeline.
+
+Phase 3: The Alignment & Analysis Engine (Week 3)
+
+Merge and structure the two data feeds into a chronological analytical matrix.
+• The Interleaving Algorithm: Merge both arrays and sort them strictly ascending by session_timestamp_ms.
+• Silence Detection: Traverse the unified timeline. Flag gaps where event_type == "code_mutation" continuous duration exceeds 12,000ms without an interleaved speech_token.
+• Semantic Proximity Evaluation: Pack sequential windows of 30 seconds of code changes and 30 seconds of transcripts into a prompt structured for an LLM (e.g., GPT-4o or Claude 3.5 Sonnet).
+[System Rubric: Critically review if the candidate is describing literal text ("typing def...") or communicating logic ("handling null payloads first...")]
+
+Phase 4: Shareable Portfolio Deliverables (Week 4)
+
+Build the viral loop mechanics to ensure maximum platform visibility.
+• Interactive Review Dashboard: Render a side-by-side timeline view using a charting library (like Recharts). Clicking a word or phrase moves the code playback pointer to the exact line modified during that second.
+• Visual Score Card Card Generation: Use an image processing engine (or an HTML-to-image library) to format visual metric snapshots summarizing the session:
+	• Communication Coherence Score (e.g., 84%)
+	• Code to Talk Ratio (e.g., 40% explanation / 60% silent typing)
+	• Primary Critique Flag: "Narrating syntax on lines 12–18 instead of stating architectural assumptions."
+
+Critical Engineering Gotchas & Mitigation
+
+
+Potential Risk	Technical Impact	Engineering Mitigation Strategy
+Clock Drift	Frontend timers can drift away from backend transcription segments over longer 45-minute sessions.	Force synchronization pings down the WebSocket channels every 30 seconds to recalibrate and align timestamps.
+AST Parsing Failure	Attempting to compile raw text snippets mid-type fails because the code is often syntactically broken.	Avoid heavy AST parses mid-session. Rely on lightweight regex or structural diff patterns (inserted "for", inserted "def") to identify context changes.
+LLM Token Overflows	Passing a long, keystroke-by-keystroke timeline into an LLM context wastes tokens and causes hallucinated reviews.	Compact consecutive keystrokes on the same line into unified summary events (e.g., "User spent 14s writing the body of line 4") before shipping data to the model.
+
+Would you like to review the exact Python implementation for the Timeline Alignment algorithm, or should we design the system prompt and schema to ensure the LLM outputs valid JSON evaluation flags?

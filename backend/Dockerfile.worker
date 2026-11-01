@@ -1,0 +1,12 @@
+FROM python:3.11-slim-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg build-essential curl \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY backend/requirements.txt ./requirements.txt
+COPY backend/requirements-worker.txt ./requirements-worker.txt
+RUN pip install --no-cache-dir -r requirements-worker.txt
+COPY backend/app ./app
+ENV PYTHONPATH=/app AUDIO_DIR=/data/sessions WHISPER_DEVICE=cpu WHISPER_COMPUTE_TYPE=int8
+RUN mkdir -p /data/sessions
+CMD ["python", "-m", "app.worker"]
